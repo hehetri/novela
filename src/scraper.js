@@ -98,21 +98,35 @@ function collectSameSiteFrames(pageHtml, pageUrl) {
   )];
 }
 
+function collectScriptUrls(pageHtml, pageUrl) {
+  const $ = cheerio.load(pageHtml);
+  return [...new Set(
+    $("script[src]")
+      .map((_, el) => abs($(el).attr("src"), pageUrl))
+      .get()
+      .filter(Boolean)
+      .filter(sameSite)
+  )];
+}
+
 function collectAstUrls(pageHtml, pageUrl) {
   const found = new Set();
+
   const add = value => {
     if (!value) return;
-    const u = abs(value, pageUrl);
+    const clean = String(value).replace(/[\\'")<>]+$/g, "");
+    const u = abs(clean, pageUrl);
     if (u && sameSite(u) && /\/ast\//i.test(u)) found.add(u);
   };
 
   const $ = cheerio.load(pageHtml);
+
   $("script[src],link[href],iframe[src]").each((_, el) => {
     add($(el).attr("src") || $(el).attr("href"));
   });
 
-  // Also catch URLs embedded in inline scripts or HTML attributes.
-  const re = /(?:https?:\/\/[^"'\\s]+)?\/ast\/[^"'\\s<)]+/gi;
+  // Find normal /ast/... references embedded in HTML/JS.
+  const re = /(?:https?:\/\/[^"'\s]+)?\/ast\/[^"'\s<)]+/gi;
   for (const m of pageHtml.match(re) || []) add(m);
 
   return [...found];
@@ -139,7 +153,22 @@ function episodeFrames(pageHtml, pageUrl) {
     }
   });
 
-  return uniqueBy(out.filter(x => x.playerUrl), x => x.playerUrl);
+  // Fallback for an HTML fragment embedded as a JS string.
+  const re = /(?:src|iframeSrc|playerUrl)\s*[:=]\s*["']([^"']*\/ast\/OnW\/[^"']+)["']/gi;
+  for (const m of pageHtml.matchAll(re)) {
+    try {
+      const u = new URL(m[1], pageUrl);
+      out.push({
+        date: u.searchParams.get("date") || "",
+        playerUrl: u.href
+      });
+    } catch {}
+  }
+
+  return uniqueBy(
+    out.filter(x => x.playerUrl && sameSite(x.playerUrl)),
+    x => x.playerUrl
+  );
 }
 
 async function resolveEpisode(id) {
@@ -196,10 +225,35 @@ async function getNovelaById(id) {
 
   let eps = episodeFrames(page, pageUrl);
 
-  // Xonados also exposes the episode list through a normal same-site
-  // /ast/FzY resource loaded by the novela page. We only follow the
-  // public HTML/JS references present in the page; no access-control
-  // bypass is performed.
+  // First follow loader scripts referenced by the novela page. The
+  // public site can load /ast/FzY indirectly from one of these scripts.
+  let scriptUrls = collectScriptUrls(page, pageUrl);
+
+  for (const scriptUrl of scriptUrls.slice(0, 10)) {
+    try {
+      const script = await html(scriptUrl);
+      const nestedAst = collectAstUrls(script, scriptUrl);
+
+      for (const astUrl of nestedAst) {
+        if (/\/ast\/OnW\//i.test(astUrl)) continue;
+        try {
+          const body = await html(astUrl);
+          eps = eps.concat(episodeFrames(body, astUrl));
+        } catch {}
+      }
+
+      // A loader may include the episode fragment itself as a string.
+      eps = eps.concat(episodeFrames(script, scriptUrl));
+
+      // Follow one more level of script references, but keep the request
+      // count bounded.
+      scriptUrls = scriptUrls.concat(
+        collectScriptUrls(script, scriptUrl)
+      );
+    } catch {}
+  }
+
+  // Also inspect any /ast/ resources directly present in the page.
   const astUrls = collectAstUrls(page, pageUrl);
   const prioritized = [
     ...astUrls.filter(u => /\/ast\/FzY(?:[/?#]|$)/i.test(u)),
@@ -213,8 +267,6 @@ async function getNovelaById(id) {
     } catch {}
   }
 
-  // Some installations expose the list one level deeper through a
-  // same-site iframe.
   for (const frame of collectSameSiteFrames(page, pageUrl).slice(0, 10)) {
     if (/\/ast\/OnW\//i.test(frame)) continue;
     try {
@@ -226,6 +278,13 @@ async function getNovelaById(id) {
     eps.filter(e => e.playerUrl && sameSite(e.playerUrl)),
     x => x.playerUrl
   ).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+
+  console.log("[xonados] meta", {
+    pageUrl,
+    scripts: scriptUrls.length,
+    episodes: eps.length,
+    sample: eps.slice(0, 3)
+  });
 
   const videos = eps.map((e, i) => ({
     id: enc("episode", e.playerUrl),
