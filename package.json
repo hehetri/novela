@@ -1,0 +1,16 @@
+{
+  "name": "xonados-stremio",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "axios": "^1.12.2",
+    "cheerio": "^1.1.2",
+    "express": "^5.1.0",
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}
