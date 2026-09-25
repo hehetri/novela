@@ -46,6 +46,15 @@ function titleFromLink($, el) {
   ).trim();
 }
 
+function isNovelaUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname === HOST && /@novela\//i.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
 function parseNovelaLinks(pageHtml, pageUrl = BASE_URL) {
   const $ = cheerio.load(pageHtml);
   const items = [];
@@ -55,7 +64,7 @@ function parseNovelaLinks(pageHtml, pageUrl = BASE_URL) {
     if (!href) return;
 
     const url = abs(href, pageUrl);
-    if (!url || !sameSite(url) || !/@novela\//i.test(url)) return;
+    if (!url || !isNovelaUrl(url)) return;
 
     const name = titleFromLink($, el);
     if (!name || name.length < 2) return;
@@ -127,28 +136,10 @@ function episodeFrames(pageHtml, pageUrl) {
     }
   });
 
-  // The public novela HTML may contain episode placeholders without the
-  // iframe rendered yet. Read date values and the corresponding normal
-  // same-site /ast/OnW URL from the HTML/inline scripts when available.
-  const htmlText = pageHtml;
-  const dateRe = /(?:data-ts\s*=\s*["']?|date\s*[:=]\s*["'])(\d{8})["']/gi;
-  const dates = [...new Set([...htmlText.matchAll(dateRe)].map(m => m[1]))];
-
   const onwRe = /(?:https?:\/\/[^"'\s]+)?\/ast\/OnW\/\?(?:[^"'\s<>]+)/gi;
-  for (const m of htmlText.match(onwRe) || []) {
+  for (const m of pageHtml.match(onwRe) || []) {
     try {
       const u = new URL(m, pageUrl);
-      const date = u.searchParams.get("date") || "";
-      out.push({ date, playerUrl: u.href });
-    } catch {}
-  }
-
-  // Pair dates with an exact y token when the page/script exposes the URL
-  // pattern as a normal string. This only reconstructs the public iframe URL.
-  const paired = /\/ast\/OnW\/\?([^"'<>\s]+)/gi;
-  for (const m of htmlText.matchAll(paired)) {
-    try {
-      const u = new URL(`/ast/OnW/?${m[1]}`, pageUrl);
       out.push({
         date: u.searchParams.get("date") || "",
         playerUrl: u.href
@@ -216,9 +207,6 @@ async function getNovelaById(id) {
 
   let eps = episodeFrames(page, pageUrl);
 
-  // Follow normal public script resources. This is intentionally limited
-  // to ordinary HTML/JS references and does not bypass authentication,
-  // DRM, or other access controls.
   const scriptUrls = collectScriptUrls(page, pageUrl);
   for (const scriptUrl of scriptUrls.slice(0, 20)) {
     try {
@@ -282,7 +270,17 @@ async function getNovelas(search = "") {
   const root = await html("/");
   let items = parseNovelaLinks(root, BASE_URL);
 
+  // Keep the catalog discovery that was already working: the homepage
+  // links point to individual /@novela/... pages.
   const $ = cheerio.load(root);
+  const candidatePages = $("a[href]")
+    .map((_, el) => abs($(el).attr("href"), BASE_URL))
+    .get()
+    .filter(Boolean)
+    .filter(isNovelaUrl)
+    .filter(url => url !== BASE_URL);
+
+  // Some pages are exposed through same-site iframes.
   const frames = $("iframe[src]")
     .map((_, el) => abs($(el).attr("src"), BASE_URL))
     .get()
@@ -291,6 +289,12 @@ async function getNovelas(search = "") {
 
   for (const frame of [...new Set(frames)].slice(0, 20)) {
     try { items = items.concat(parseNovelaLinks(await html(frame), frame)); } catch {}
+  }
+
+  // Crawl the novela pages linked from the homepage only as a fallback.
+  // This restores the behavior that produced the working catalog.
+  for (const url of [...new Set(candidatePages)].slice(0, 30)) {
+    try { items = items.concat(parseNovelaLinks(await html(url), url)); } catch {}
   }
 
   items = uniqueBy(items, x => x.id);
