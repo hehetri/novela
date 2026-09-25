@@ -23,8 +23,8 @@ const dec = (id, p) => {
   catch { return null; }
 };
 
-async function html(url) {
-  const r = await client.get(url);
+async function html(url, headers = {}) {
+  const r = await client.get(url, { headers });
   return typeof r.data === "string" ? r.data : "";
 }
 
@@ -121,6 +121,30 @@ function episodeFrames(pageHtml, pageUrl) {
   return uniqueBy(out.filter(x => x.playerUrl), x => x.playerUrl);
 }
 
+async function getEpisodeFeed(pageUrl) {
+  // The novela page itself does not contain the episode iframes.
+  // The public page flow loads the episode fragment from /ast/FzY.
+  const candidates = [
+    `${BASE_URL}/ast/FzY`,
+    `${BASE_URL}/ast/FzY/`
+  ];
+
+  for (const feedUrl of candidates) {
+    try {
+      const body = await html(feedUrl, {
+        "Referer": pageUrl,
+        "Origin": BASE_URL,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      });
+
+      const eps = episodeFrames(body, feedUrl);
+      if (eps.length) return eps;
+    } catch {}
+  }
+
+  return [];
+}
+
 async function resolveEpisode(id) {
   const playerUrl = dec(id, "episode");
   if (!playerUrl) return null;
@@ -171,14 +195,22 @@ async function getNovelaById(id) {
     pageUrl
   );
 
+  // Keep the old direct parsing first.
   let eps = episodeFrames(page, pageUrl);
 
+  // Xonados currently exposes the episode list through /ast/FzY.
+  if (!eps.length) {
+    eps = await getEpisodeFeed(pageUrl);
+  }
+
   // Some pages expose the episode iframe one level deeper.
-  for (const frame of collectSameSiteFrames(page, pageUrl)) {
-    if (/\/ast\/OnW\//i.test(frame)) continue;
-    try {
-      eps = eps.concat(episodeFrames(await html(frame), frame));
-    } catch {}
+  if (!eps.length) {
+    for (const frame of collectSameSiteFrames(page, pageUrl)) {
+      if (/\/ast\/OnW\//i.test(frame)) continue;
+      try {
+        eps = eps.concat(episodeFrames(await html(frame), frame));
+      } catch {}
+    }
   }
 
   eps = uniqueBy(eps, x => x.playerUrl)
