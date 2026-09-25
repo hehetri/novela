@@ -200,7 +200,7 @@ async function getEpisodeFeedWithBrowser(pageUrl) {
         });
         document.querySelectorAll("iframe[src]").forEach(iframe => {
           const src = iframe.getAttribute("src") || "";
-          if (/\\/ast\\/OnW\\//i.test(src)) {
+          if (src.includes("/ast/OnW/")) {
             out.push({ date: "", src });
           }
         });
@@ -213,7 +213,7 @@ async function getEpisodeFeedWithBrowser(pageUrl) {
         if (!playerUrl) continue;
         try {
           const u = new URL(playerUrl);
-          if (u.hostname !== HOST || !/\\/ast\\/OnW\\//i.test(u.pathname)) continue;
+          if (u.hostname !== HOST || !u.pathname.includes("/ast/OnW/")) continue;
           discovered.add(JSON.stringify({
             date: item.date || u.searchParams.get("date") || "",
             playerUrl
