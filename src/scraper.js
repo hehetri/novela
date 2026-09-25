@@ -32,8 +32,14 @@ function uniqueBy(items, key) {
   return [...new Map(items.map(x => [key(x), x])).values()];
 }
 
-function sameSite(url) {
-  try { return new URL(url).hostname === HOST; } catch { return false; }
+function looksLikeNovelaUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname !== HOST) return false;
+    return /novela|novelas|serie|series|tv/i.test(u.pathname + u.search);
+  } catch {
+    return false;
+  }
 }
 
 function titleFromLink($, el) {
@@ -46,15 +52,6 @@ function titleFromLink($, el) {
   ).trim();
 }
 
-function isNovelaUrl(url) {
-  try {
-    const u = new URL(url);
-    return u.hostname === HOST && /@novela\//i.test(u.pathname);
-  } catch {
-    return false;
-  }
-}
-
 function parseNovelaLinks(pageHtml, pageUrl = BASE_URL) {
   const $ = cheerio.load(pageHtml);
   const items = [];
@@ -64,7 +61,7 @@ function parseNovelaLinks(pageHtml, pageUrl = BASE_URL) {
     if (!href) return;
 
     const url = abs(href, pageUrl);
-    if (!url || !isNovelaUrl(url)) return;
+    if (!url || !looksLikeNovelaUrl(url)) return;
 
     const name = titleFromLink($, el);
     if (!name || name.length < 2) return;
@@ -86,33 +83,18 @@ function parseNovelaLinks(pageHtml, pageUrl = BASE_URL) {
   return uniqueBy(items, x => x.id);
 }
 
-function collectScriptUrls(pageHtml, pageUrl) {
+function collectSameSiteFrames(pageHtml, pageUrl) {
   const $ = cheerio.load(pageHtml);
   return [...new Set(
-    $("script[src]")
+    $("iframe[src]")
       .map((_, el) => abs($(el).attr("src"), pageUrl))
       .get()
       .filter(Boolean)
-      .filter(sameSite)
+      .filter(url => {
+        try { return new URL(url).hostname === HOST; }
+        catch { return false; }
+      })
   )];
-}
-
-function collectAstUrls(pageHtml, pageUrl) {
-  const found = new Set();
-  const add = value => {
-    if (!value) return;
-    const u = abs(value, pageUrl);
-    if (u && sameSite(u) && /\/ast\//i.test(u)) found.add(u);
-  };
-
-  const $ = cheerio.load(pageHtml);
-  $("script[src],iframe[src]").each((_, el) => add($(el).attr("src")));
-
-  for (const m of pageHtml.match(/(?:https?:\/\/[^"'\s]+)?\/ast\/[^"'\s<)]+/gi) || []) {
-    add(m);
-  }
-
-  return [...found];
 }
 
 function episodeFrames(pageHtml, pageUrl) {
@@ -136,30 +118,15 @@ function episodeFrames(pageHtml, pageUrl) {
     }
   });
 
-  const onwRe = /(?:https?:\/\/[^"'\s]+)?\/ast\/OnW\/\?(?:[^"'\s<>]+)/gi;
-  for (const m of pageHtml.match(onwRe) || []) {
-    try {
-      const u = new URL(m, pageUrl);
-      out.push({
-        date: u.searchParams.get("date") || "",
-        playerUrl: u.href
-      });
-    } catch {}
-  }
-
-  return uniqueBy(
-    out.filter(x => x.playerUrl && sameSite(x.playerUrl)),
-    x => x.playerUrl
-  );
+  return uniqueBy(out.filter(x => x.playerUrl), x => x.playerUrl);
 }
 
 async function resolveEpisode(id) {
   const playerUrl = dec(id, "episode");
-  if (!playerUrl || !sameSite(playerUrl)) return null;
+  if (!playerUrl) return null;
 
   const page = await html(playerUrl);
   const $ = cheerio.load(page);
-
   const src = $("video source[src]")
     .map((_, el) => $(el).attr("src"))
     .get()
@@ -183,11 +150,10 @@ async function resolveEpisode(id) {
 
 async function getNovelaById(id) {
   const pageUrl = dec(id, "novela");
-  if (!pageUrl || !sameSite(pageUrl)) return null;
+  if (!pageUrl) return null;
 
   const page = await html(pageUrl);
   const $ = cheerio.load(page);
-
   const name =
     $("meta[property='og:title']").attr("content") ||
     $("h1").first().text().trim() ||
@@ -207,47 +173,20 @@ async function getNovelaById(id) {
 
   let eps = episodeFrames(page, pageUrl);
 
-  const scriptUrls = collectScriptUrls(page, pageUrl);
-  for (const scriptUrl of scriptUrls.slice(0, 20)) {
+  // Some pages expose the episode iframe one level deeper.
+  for (const frame of collectSameSiteFrames(page, pageUrl)) {
+    if (/\/ast\/OnW\//i.test(frame)) continue;
     try {
-      const script = await html(scriptUrl);
-      eps = eps.concat(episodeFrames(script, scriptUrl));
-
-      for (const astUrl of collectAstUrls(script, scriptUrl).slice(0, 10)) {
-        if (/\/ast\/OnW\//i.test(astUrl)) continue;
-        try {
-          eps = eps.concat(episodeFrames(await html(astUrl), astUrl));
-        } catch {}
-      }
+      eps = eps.concat(episodeFrames(await html(frame), frame));
     } catch {}
   }
 
-  for (const frame of [...new Set(
-    $("iframe[src]")
-      .map((_, el) => abs($(el).attr("src"), pageUrl))
-      .get()
-      .filter(Boolean)
-      .filter(sameSite)
-  )].slice(0, 10)) {
-    if (/\/ast\/OnW\//i.test(frame)) continue;
-    try { eps = eps.concat(episodeFrames(await html(frame), frame)); } catch {}
-  }
-
-  eps = uniqueBy(
-    eps.filter(e => e.playerUrl && sameSite(e.playerUrl)),
-    x => x.playerUrl
-  ).sort((a, b) => String(b.date).localeCompare(String(a.date)));
-
-  console.log("[xonados] meta", {
-    pageUrl,
-    scripts: scriptUrls.length,
-    episodes: eps.length,
-    sample: eps.slice(0, 5)
-  });
+  eps = uniqueBy(eps, x => x.playerUrl)
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)));
 
   const videos = eps.map((e, i) => ({
     id: enc("episode", e.playerUrl),
-    title: e.date ? `Episódio ${e.date}` : `Episódio ${i + 1}`,
+    title: e.date ? `Capítulo ${e.date}` : `Capítulo ${i + 1}`,
     season: 1,
     episode: i + 1,
     ...(e.date && /^\d{8}$/.test(e.date)
@@ -268,33 +207,33 @@ async function getNovelaById(id) {
 
 async function getNovelas(search = "") {
   const root = await html("/");
-  let items = parseNovelaLinks(root, BASE_URL);
+  let pages = [{ html: root, url: BASE_URL }];
 
-  // Keep the catalog discovery that was already working: the homepage
-  // links point to individual /@novela/... pages.
+  // Follow ordinary same-site iframes from the homepage.
+  const frames = collectSameSiteFrames(root, BASE_URL);
+  for (const frame of frames.slice(0, 20)) {
+    try { pages.push({ html: await html(frame), url: frame }); } catch {}
+  }
+
+  let items = [];
+  for (const p of pages) {
+    items = items.concat(parseNovelaLinks(p.html, p.url));
+  }
+
+  // Also inspect normal same-site links whose path suggests a catalog/listing.
   const $ = cheerio.load(root);
   const candidatePages = $("a[href]")
     .map((_, el) => abs($(el).attr("href"), BASE_URL))
     .get()
     .filter(Boolean)
-    .filter(isNovelaUrl)
-    .filter(url => url !== BASE_URL);
+    .filter(looksLikeNovelaUrl)
+    .filter(url => url !== BASE_URL)
+    .slice(0, 30);
 
-  // Some pages are exposed through same-site iframes.
-  const frames = $("iframe[src]")
-    .map((_, el) => abs($(el).attr("src"), BASE_URL))
-    .get()
-    .filter(Boolean)
-    .filter(sameSite);
-
-  for (const frame of [...new Set(frames)].slice(0, 20)) {
-    try { items = items.concat(parseNovelaLinks(await html(frame), frame)); } catch {}
-  }
-
-  // Crawl the novela pages linked from the homepage only as a fallback.
-  // This restores the behavior that produced the working catalog.
-  for (const url of [...new Set(candidatePages)].slice(0, 30)) {
-    try { items = items.concat(parseNovelaLinks(await html(url), url)); } catch {}
+  for (const url of [...new Set(candidatePages)]) {
+    try {
+      items = items.concat(parseNovelaLinks(await html(url), url));
+    } catch {}
   }
 
   items = uniqueBy(items, x => x.id);
