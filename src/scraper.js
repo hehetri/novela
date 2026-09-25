@@ -32,6 +32,10 @@ function uniqueBy(items, key) {
   return [...new Map(items.map(x => [key(x), x])).values()];
 }
 
+function sameSite(url) {
+  try { return new URL(url).hostname === HOST; } catch { return false; }
+}
+
 function looksLikeNovelaUrl(url) {
   try {
     const u = new URL(url);
@@ -90,11 +94,28 @@ function collectSameSiteFrames(pageHtml, pageUrl) {
       .map((_, el) => abs($(el).attr("src"), pageUrl))
       .get()
       .filter(Boolean)
-      .filter(url => {
-        try { return new URL(url).hostname === HOST; }
-        catch { return false; }
-      })
+      .filter(sameSite)
   )];
+}
+
+function collectAstUrls(pageHtml, pageUrl) {
+  const found = new Set();
+  const add = value => {
+    if (!value) return;
+    const u = abs(value, pageUrl);
+    if (u && sameSite(u) && /\/ast\//i.test(u)) found.add(u);
+  };
+
+  const $ = cheerio.load(pageHtml);
+  $("script[src],link[href],iframe[src]").each((_, el) => {
+    add($(el).attr("src") || $(el).attr("href"));
+  });
+
+  // Also catch URLs embedded in inline scripts or HTML attributes.
+  const re = /(?:https?:\/\/[^"'\\s]+)?\/ast\/[^"'\\s<)]+/gi;
+  for (const m of pageHtml.match(re) || []) add(m);
+
+  return [...found];
 }
 
 function episodeFrames(pageHtml, pageUrl) {
@@ -123,10 +144,11 @@ function episodeFrames(pageHtml, pageUrl) {
 
 async function resolveEpisode(id) {
   const playerUrl = dec(id, "episode");
-  if (!playerUrl) return null;
+  if (!playerUrl || !sameSite(playerUrl)) return null;
 
   const page = await html(playerUrl);
   const $ = cheerio.load(page);
+
   const src = $("video source[src]")
     .map((_, el) => $(el).attr("src"))
     .get()
@@ -150,10 +172,11 @@ async function resolveEpisode(id) {
 
 async function getNovelaById(id) {
   const pageUrl = dec(id, "novela");
-  if (!pageUrl) return null;
+  if (!pageUrl || !sameSite(pageUrl)) return null;
 
   const page = await html(pageUrl);
   const $ = cheerio.load(page);
+
   const name =
     $("meta[property='og:title']").attr("content") ||
     $("h1").first().text().trim() ||
@@ -173,16 +196,36 @@ async function getNovelaById(id) {
 
   let eps = episodeFrames(page, pageUrl);
 
-  // Some pages expose the episode iframe one level deeper.
-  for (const frame of collectSameSiteFrames(page, pageUrl)) {
+  // Xonados also exposes the episode list through a normal same-site
+  // /ast/FzY resource loaded by the novela page. We only follow the
+  // public HTML/JS references present in the page; no access-control
+  // bypass is performed.
+  const astUrls = collectAstUrls(page, pageUrl);
+  const prioritized = [
+    ...astUrls.filter(u => /\/ast\/FzY(?:[/?#]|$)/i.test(u)),
+    ...astUrls.filter(u => !/\/ast\/OnW\//i.test(u))
+  ];
+
+  for (const url of [...new Set(prioritized)].slice(0, 10)) {
+    try {
+      const body = await html(url);
+      eps = eps.concat(episodeFrames(body, url));
+    } catch {}
+  }
+
+  // Some installations expose the list one level deeper through a
+  // same-site iframe.
+  for (const frame of collectSameSiteFrames(page, pageUrl).slice(0, 10)) {
     if (/\/ast\/OnW\//i.test(frame)) continue;
     try {
       eps = eps.concat(episodeFrames(await html(frame), frame));
     } catch {}
   }
 
-  eps = uniqueBy(eps, x => x.playerUrl)
-    .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  eps = uniqueBy(
+    eps.filter(e => e.playerUrl && sameSite(e.playerUrl)),
+    x => x.playerUrl
+  ).sort((a, b) => String(b.date).localeCompare(String(a.date)));
 
   const videos = eps.map((e, i) => ({
     id: enc("episode", e.playerUrl),
@@ -209,18 +252,14 @@ async function getNovelas(search = "") {
   const root = await html("/");
   let pages = [{ html: root, url: BASE_URL }];
 
-  // Follow ordinary same-site iframes from the homepage.
   const frames = collectSameSiteFrames(root, BASE_URL);
   for (const frame of frames.slice(0, 20)) {
     try { pages.push({ html: await html(frame), url: frame }); } catch {}
   }
 
   let items = [];
-  for (const p of pages) {
-    items = items.concat(parseNovelaLinks(p.html, p.url));
-  }
+  for (const p of pages) items = items.concat(parseNovelaLinks(p.html, p.url));
 
-  // Also inspect normal same-site links whose path suggests a catalog/listing.
   const $ = cheerio.load(root);
   const candidatePages = $("a[href]")
     .map((_, el) => abs($(el).attr("href"), BASE_URL))
@@ -231,9 +270,7 @@ async function getNovelas(search = "") {
     .slice(0, 30);
 
   for (const url of [...new Set(candidatePages)]) {
-    try {
-      items = items.concat(parseNovelaLinks(await html(url), url));
-    } catch {}
+    try { items = items.concat(parseNovelaLinks(await html(url), url)); } catch {}
   }
 
   items = uniqueBy(items, x => x.id);
