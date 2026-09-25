@@ -2,6 +2,7 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 
 const BASE_URL = "https://www.xonados.com";
+const HOST = new URL(BASE_URL).hostname;
 
 const client = axios.create({
   baseURL: BASE_URL,
@@ -18,20 +19,82 @@ const enc = (p, u) => `xonados:${p}:${Buffer.from(u, "utf8").toString("base64url
 const dec = (id, p) => {
   const m = `xonados:${p}:`;
   if (!id?.startsWith(m)) return null;
-  try {
-    return Buffer.from(id.slice(m.length), "base64url").toString("utf8");
-  } catch {
-    return null;
-  }
+  try { return Buffer.from(id.slice(m.length), "base64url").toString("utf8"); }
+  catch { return null; }
 };
 
 async function html(url) {
   const r = await client.get(url);
-  return r.data;
+  return typeof r.data === "string" ? r.data : "";
 }
 
 function uniqueBy(items, key) {
   return [...new Map(items.map(x => [key(x), x])).values()];
+}
+
+function looksLikeNovelaUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname !== HOST) return false;
+    return /novela|novelas|serie|series|tv/i.test(u.pathname + u.search);
+  } catch {
+    return false;
+  }
+}
+
+function titleFromLink($, el) {
+  return (
+    $(el).attr("title") ||
+    $(el).find("[title]").first().attr("title") ||
+    $(el).find("img").first().attr("alt") ||
+    $(el).find("img").first().attr("title") ||
+    $(el).text().replace(/\s+/g, " ").trim()
+  ).trim();
+}
+
+function parseNovelaLinks(pageHtml, pageUrl = BASE_URL) {
+  const $ = cheerio.load(pageHtml);
+  const items = [];
+
+  $("a[href]").each((_, el) => {
+    const href = $(el).attr("href");
+    if (!href) return;
+
+    const url = abs(href, pageUrl);
+    if (!url || !looksLikeNovelaUrl(url)) return;
+
+    const name = titleFromLink($, el);
+    if (!name || name.length < 2) return;
+
+    const poster = abs(
+      $(el).find("img").first().attr("src") ||
+      $(el).find("img").first().attr("data-src"),
+      pageUrl
+    );
+
+    items.push({
+      id: enc("novela", url),
+      type: "series",
+      name,
+      ...(poster ? { poster } : {})
+    });
+  });
+
+  return uniqueBy(items, x => x.id);
+}
+
+function collectSameSiteFrames(pageHtml, pageUrl) {
+  const $ = cheerio.load(pageHtml);
+  return [...new Set(
+    $("iframe[src]")
+      .map((_, el) => abs($(el).attr("src"), pageUrl))
+      .get()
+      .filter(Boolean)
+      .filter(url => {
+        try { return new URL(url).hostname === HOST; }
+        catch { return false; }
+      })
+  )];
 }
 
 function episodeFrames(pageHtml, pageUrl) {
@@ -64,7 +127,6 @@ async function resolveEpisode(id) {
 
   const page = await html(playerUrl);
   const $ = cheerio.load(page);
-
   const src = $("video source[src]")
     .map((_, el) => $(el).attr("src"))
     .get()
@@ -92,7 +154,6 @@ async function getNovelaById(id) {
 
   const page = await html(pageUrl);
   const $ = cheerio.load(page);
-
   const name =
     $("meta[property='og:title']").attr("content") ||
     $("h1").first().text().trim() ||
@@ -110,7 +171,17 @@ async function getNovelaById(id) {
     pageUrl
   );
 
-  const eps = episodeFrames(page, pageUrl)
+  let eps = episodeFrames(page, pageUrl);
+
+  // Some pages expose the episode iframe one level deeper.
+  for (const frame of collectSameSiteFrames(page, pageUrl)) {
+    if (/\/ast\/OnW\//i.test(frame)) continue;
+    try {
+      eps = eps.concat(episodeFrames(await html(frame), frame));
+    } catch {}
+  }
+
+  eps = uniqueBy(eps, x => x.playerUrl)
     .sort((a, b) => String(b.date).localeCompare(String(a.date)));
 
   const videos = eps.map((e, i) => ({
@@ -134,63 +205,42 @@ async function getNovelaById(id) {
   };
 }
 
-function parseNovelaLinks(pageHtml) {
-  const $ = cheerio.load(pageHtml);
-  const items = [];
-
-  $("a[href]").each((_, el) => {
-    const href = $(el).attr("href");
-    const text = $(el).text().replace(/\s+/g, " ").trim();
-    if (!href || !text) return;
-
-    const url = abs(href);
-
-    if (/xonados\.com\/@novela\//i.test(url)) {
-      items.push({
-        id: enc("novela", url),
-        type: "series",
-        name: text,
-        poster: abs(
-          $(el).find("img").first().attr("src"),
-          url
-        )
-      });
-    }
-  });
-
-  return uniqueBy(items, x => x.id);
-}
-
 async function getNovelas(search = "") {
-  const page = await html("/");
-  let items = parseNovelaLinks(page);
+  const root = await html("/");
+  let pages = [{ html: root, url: BASE_URL }];
 
-  // The homepage can load content through an iframe. Follow ordinary
-  // same-site iframe HTML and collect novela links from those documents.
-  const $ = cheerio.load(page);
-  const iframeUrls = $("iframe[src]")
-    .map((_, el) => abs($(el).attr("src"), BASE_URL))
+  // Follow ordinary same-site iframes from the homepage.
+  const frames = collectSameSiteFrames(root, BASE_URL);
+  for (const frame of frames.slice(0, 20)) {
+    try { pages.push({ html: await html(frame), url: frame }); } catch {}
+  }
+
+  let items = [];
+  for (const p of pages) {
+    items = items.concat(parseNovelaLinks(p.html, p.url));
+  }
+
+  // Also inspect normal same-site links whose path suggests a catalog/listing.
+  const $ = cheerio.load(root);
+  const candidatePages = $("a[href]")
+    .map((_, el) => abs($(el).attr("href"), BASE_URL))
     .get()
     .filter(Boolean)
-    .filter(url => new URL(url).hostname === new URL(BASE_URL).hostname);
+    .filter(looksLikeNovelaUrl)
+    .filter(url => url !== BASE_URL)
+    .slice(0, 30);
 
-  for (const iframeUrl of [...new Set(iframeUrls)]) {
+  for (const url of [...new Set(candidatePages)]) {
     try {
-      const iframeHtml = await html(iframeUrl);
-      items = items.concat(parseNovelaLinks(iframeHtml));
-    } catch {
-      // One failed optional iframe must not break the whole catalog.
-    }
+      items = items.concat(parseNovelaLinks(await html(url), url));
+    } catch {}
   }
 
   items = uniqueBy(items, x => x.id);
 
   if (!search) return items.slice(0, 100);
-
   const q = search.toLowerCase();
-  return items
-    .filter(x => x.name.toLowerCase().includes(q))
-    .slice(0, 100);
+  return items.filter(x => x.name.toLowerCase().includes(q)).slice(0, 100);
 }
 
 module.exports = {
