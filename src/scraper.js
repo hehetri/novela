@@ -36,16 +36,6 @@ function sameSite(url) {
   try { return new URL(url).hostname === HOST; } catch { return false; }
 }
 
-function looksLikeNovelaUrl(url) {
-  try {
-    const u = new URL(url);
-    if (u.hostname !== HOST) return false;
-    return /novela|novelas|serie|series|tv/i.test(u.pathname + u.search);
-  } catch {
-    return false;
-  }
-}
-
 function titleFromLink($, el) {
   return (
     $(el).attr("title") ||
@@ -65,7 +55,7 @@ function parseNovelaLinks(pageHtml, pageUrl = BASE_URL) {
     if (!href) return;
 
     const url = abs(href, pageUrl);
-    if (!url || !looksLikeNovelaUrl(url)) return;
+    if (!url || !sameSite(url) || !/@novela\//i.test(url)) return;
 
     const name = titleFromLink($, el);
     if (!name || name.length < 2) return;
@@ -87,17 +77,6 @@ function parseNovelaLinks(pageHtml, pageUrl = BASE_URL) {
   return uniqueBy(items, x => x.id);
 }
 
-function collectSameSiteFrames(pageHtml, pageUrl) {
-  const $ = cheerio.load(pageHtml);
-  return [...new Set(
-    $("iframe[src]")
-      .map((_, el) => abs($(el).attr("src"), pageUrl))
-      .get()
-      .filter(Boolean)
-      .filter(sameSite)
-  )];
-}
-
 function collectScriptUrls(pageHtml, pageUrl) {
   const $ = cheerio.load(pageHtml);
   return [...new Set(
@@ -111,23 +90,18 @@ function collectScriptUrls(pageHtml, pageUrl) {
 
 function collectAstUrls(pageHtml, pageUrl) {
   const found = new Set();
-
   const add = value => {
     if (!value) return;
-    const clean = String(value).replace(/[\\'")<>]+$/g, "");
-    const u = abs(clean, pageUrl);
+    const u = abs(value, pageUrl);
     if (u && sameSite(u) && /\/ast\//i.test(u)) found.add(u);
   };
 
   const $ = cheerio.load(pageHtml);
+  $("script[src],iframe[src]").each((_, el) => add($(el).attr("src")));
 
-  $("script[src],link[href],iframe[src]").each((_, el) => {
-    add($(el).attr("src") || $(el).attr("href"));
-  });
-
-  // Find normal /ast/... references embedded in HTML/JS.
-  const re = /(?:https?:\/\/[^"'\s]+)?\/ast\/[^"'\s<)]+/gi;
-  for (const m of pageHtml.match(re) || []) add(m);
+  for (const m of pageHtml.match(/(?:https?:\/\/[^"'\s]+)?\/ast\/[^"'\s<)]+/gi) || []) {
+    add(m);
+  }
 
   return [...found];
 }
@@ -153,11 +127,28 @@ function episodeFrames(pageHtml, pageUrl) {
     }
   });
 
-  // Fallback for an HTML fragment embedded as a JS string.
-  const re = /(?:src|iframeSrc|playerUrl)\s*[:=]\s*["']([^"']*\/ast\/OnW\/[^"']+)["']/gi;
-  for (const m of pageHtml.matchAll(re)) {
+  // The public novela HTML may contain episode placeholders without the
+  // iframe rendered yet. Read date values and the corresponding normal
+  // same-site /ast/OnW URL from the HTML/inline scripts when available.
+  const htmlText = pageHtml;
+  const dateRe = /(?:data-ts\s*=\s*["']?|date\s*[:=]\s*["'])(\d{8})["']/gi;
+  const dates = [...new Set([...htmlText.matchAll(dateRe)].map(m => m[1]))];
+
+  const onwRe = /(?:https?:\/\/[^"'\s]+)?\/ast\/OnW\/\?(?:[^"'\s<>]+)/gi;
+  for (const m of htmlText.match(onwRe) || []) {
     try {
-      const u = new URL(m[1], pageUrl);
+      const u = new URL(m, pageUrl);
+      const date = u.searchParams.get("date") || "";
+      out.push({ date, playerUrl: u.href });
+    } catch {}
+  }
+
+  // Pair dates with an exact y token when the page/script exposes the URL
+  // pattern as a normal string. This only reconstructs the public iframe URL.
+  const paired = /\/ast\/OnW\/\?([^"'<>\s]+)/gi;
+  for (const m of htmlText.matchAll(paired)) {
+    try {
+      const u = new URL(`/ast/OnW/?${m[1]}`, pageUrl);
       out.push({
         date: u.searchParams.get("date") || "",
         playerUrl: u.href
@@ -225,53 +216,33 @@ async function getNovelaById(id) {
 
   let eps = episodeFrames(page, pageUrl);
 
-  // First follow loader scripts referenced by the novela page. The
-  // public site can load /ast/FzY indirectly from one of these scripts.
-  let scriptUrls = collectScriptUrls(page, pageUrl);
-
-  for (const scriptUrl of scriptUrls.slice(0, 10)) {
+  // Follow normal public script resources. This is intentionally limited
+  // to ordinary HTML/JS references and does not bypass authentication,
+  // DRM, or other access controls.
+  const scriptUrls = collectScriptUrls(page, pageUrl);
+  for (const scriptUrl of scriptUrls.slice(0, 20)) {
     try {
       const script = await html(scriptUrl);
-      const nestedAst = collectAstUrls(script, scriptUrl);
-
-      for (const astUrl of nestedAst) {
-        if (/\/ast\/OnW\//i.test(astUrl)) continue;
-        try {
-          const body = await html(astUrl);
-          eps = eps.concat(episodeFrames(body, astUrl));
-        } catch {}
-      }
-
-      // A loader may include the episode fragment itself as a string.
       eps = eps.concat(episodeFrames(script, scriptUrl));
 
-      // Follow one more level of script references, but keep the request
-      // count bounded.
-      scriptUrls = scriptUrls.concat(
-        collectScriptUrls(script, scriptUrl)
-      );
+      for (const astUrl of collectAstUrls(script, scriptUrl).slice(0, 10)) {
+        if (/\/ast\/OnW\//i.test(astUrl)) continue;
+        try {
+          eps = eps.concat(episodeFrames(await html(astUrl), astUrl));
+        } catch {}
+      }
     } catch {}
   }
 
-  // Also inspect any /ast/ resources directly present in the page.
-  const astUrls = collectAstUrls(page, pageUrl);
-  const prioritized = [
-    ...astUrls.filter(u => /\/ast\/FzY(?:[/?#]|$)/i.test(u)),
-    ...astUrls.filter(u => !/\/ast\/OnW\//i.test(u))
-  ];
-
-  for (const url of [...new Set(prioritized)].slice(0, 10)) {
-    try {
-      const body = await html(url);
-      eps = eps.concat(episodeFrames(body, url));
-    } catch {}
-  }
-
-  for (const frame of collectSameSiteFrames(page, pageUrl).slice(0, 10)) {
+  for (const frame of [...new Set(
+    $("iframe[src]")
+      .map((_, el) => abs($(el).attr("src"), pageUrl))
+      .get()
+      .filter(Boolean)
+      .filter(sameSite)
+  )].slice(0, 10)) {
     if (/\/ast\/OnW\//i.test(frame)) continue;
-    try {
-      eps = eps.concat(episodeFrames(await html(frame), frame));
-    } catch {}
+    try { eps = eps.concat(episodeFrames(await html(frame), frame)); } catch {}
   }
 
   eps = uniqueBy(
@@ -283,12 +254,12 @@ async function getNovelaById(id) {
     pageUrl,
     scripts: scriptUrls.length,
     episodes: eps.length,
-    sample: eps.slice(0, 3)
+    sample: eps.slice(0, 5)
   });
 
   const videos = eps.map((e, i) => ({
     id: enc("episode", e.playerUrl),
-    title: e.date ? `Capítulo ${e.date}` : `Capítulo ${i + 1}`,
+    title: e.date ? `Episódio ${e.date}` : `Episódio ${i + 1}`,
     season: 1,
     episode: i + 1,
     ...(e.date && /^\d{8}$/.test(e.date)
@@ -309,27 +280,17 @@ async function getNovelaById(id) {
 
 async function getNovelas(search = "") {
   const root = await html("/");
-  let pages = [{ html: root, url: BASE_URL }];
-
-  const frames = collectSameSiteFrames(root, BASE_URL);
-  for (const frame of frames.slice(0, 20)) {
-    try { pages.push({ html: await html(frame), url: frame }); } catch {}
-  }
-
-  let items = [];
-  for (const p of pages) items = items.concat(parseNovelaLinks(p.html, p.url));
+  let items = parseNovelaLinks(root, BASE_URL);
 
   const $ = cheerio.load(root);
-  const candidatePages = $("a[href]")
-    .map((_, el) => abs($(el).attr("href"), BASE_URL))
+  const frames = $("iframe[src]")
+    .map((_, el) => abs($(el).attr("src"), BASE_URL))
     .get()
     .filter(Boolean)
-    .filter(looksLikeNovelaUrl)
-    .filter(url => url !== BASE_URL)
-    .slice(0, 30);
+    .filter(sameSite);
 
-  for (const url of [...new Set(candidatePages)]) {
-    try { items = items.concat(parseNovelaLinks(await html(url), url)); } catch {}
+  for (const frame of [...new Set(frames)].slice(0, 20)) {
+    try { items = items.concat(parseNovelaLinks(await html(frame), frame)); } catch {}
   }
 
   items = uniqueBy(items, x => x.id);
